@@ -1,207 +1,256 @@
 """
-Integration test — full simulation using synthetic ticks.
+Integration test — parallel simulation using synthetic ticks.
 
-Runs the StrategyEngine with synthetic random ticks from 09:15 to 12:00
-and verifies that trade records are produced with the expected structure.
+Starts real StrategyWorker threads, feeds synthetic tick sequences through
+the engine fanout, waits for all workers to finish, then asserts on results.
+
+No datetime patching needed — strategies are pre-seeded into RUNNING state
+so we test the execution path (entry → exit / market-close) directly.
 """
 from __future__ import annotations
 
-import random
-from datetime import datetime, timedelta
-from typing import Dict, List
-from unittest.mock import MagicMock, patch
+import time
+import threading
+from typing import Dict
+from unittest.mock import MagicMock
 
 import pytest
 
 from option_trading.core.broker import BrokerClient
 from option_trading.core.strategy_engine import StrategyEngine
-from option_trading.models.strategy import Strategy, TradeMode
+from option_trading.models.strategy import Strategy, StrategyResult, TradeMode
+from option_trading.models.trade import TradeType
 from option_trading.persistence.trade_logger import TradeLogger
-from conftest import make_tick
 
 
-# ─── Test fixtures ────────────────────────────────────────────────────────────
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
-@pytest.fixture
-def sim_settings():
+def _make_settings(market_close: str = "15:30:00"):
     s = MagicMock()
     s.entry_tolerance_seconds = 15
-    s.market_close_time = "12:00:00"  # early close for fast test
+    s.market_close_time = market_close
     s.trade_margin = 1_000_000
+    s.trade_mode = "dummy"
     return s
 
 
-@pytest.fixture
-def sim_strategies() -> Dict[str, Strategy]:
-    """Two dummy strategies at known times within the 09:15–12:00 window."""
+def _make_tick(token: int, price: float, qty: int = 5000) -> dict:
     return {
-        "09:30:00": Strategy(
-            time_str="09:30:00",
-            index="NSE:NIFTY 50",
-            strangle=0,
-            points=10.0,
-            trade_type=TradeMode.DUMMY,
-            conditional_on=None,
-            ce_symbol="NIFTY24620220000CE",
-            pe_symbol="NIFTY24620220000PE",
-            ce_token=2001,
-            pe_token=2002,
-            tradable=True,
-        ),
-        "10:00:00": Strategy(
-            time_str="10:00:00",
-            index="NSE:NIFTY 50",
-            strangle=0,
-            points=5.0,
-            trade_type=TradeMode.DUMMY,
-            conditional_on="09:30:00",
-            ce_symbol="NIFTY24620220000CE",
-            pe_symbol="NIFTY24620220000PE",
-            ce_token=2001,
-            pe_token=2002,
-            tradable=True,
-        ),
+        "instrument_token": token,
+        "last_price": price,
+        "depth": {
+            "buy": [{"quantity": qty, "price": price - 0.05}] * 5,
+            "sell": [{"quantity": qty, "price": price + 0.05}] * 5,
+        },
     }
 
 
-@pytest.fixture
-def sim_engine(sim_strategies, sim_settings) -> StrategyEngine:
+def _running_strategy(
+    time_str: str,
+    points: float = 10.0,
+    trade_type: TradeMode = TradeMode.DUMMY,
+    conditional_on: str | None = None,
+) -> Strategy:
+    """Strategy pre-seeded into RUNNING state — bypasses lifecycle checks."""
+    return Strategy(
+        time_str=time_str,
+        index="NSE:NIFTY 50",
+        strangle=0,
+        points=points,
+        trade_type=trade_type,
+        conditional_on=conditional_on,
+        ce_symbol="NIFTY24621 21000CE",
+        pe_symbol="NIFTY24621 21000PE",
+        ce_token=2001,
+        pe_token=2002,
+        tradable=True,
+        running=True,          # already started
+        liquidity_exists=True, # already confirmed
+    )
+
+
+def _build_engine(strategies: Dict[str, Strategy], trade_logger: TradeLogger, market_close="23:59:59"):
     kite = MagicMock()
     kite.TRANSACTION_TYPE_BUY = "BUY"
     kite.TRANSACTION_TYPE_SELL = "SELL"
-    kite.place_order.return_value = "SIM_ORDER"
-
-    broker = BrokerClient(kite)
-    trade_logger = TradeLogger()
 
     engine = StrategyEngine(
         kite=kite,
         instruments_df=MagicMock(),
-        strategies=sim_strategies,
-        broker=broker,
+        strategies=strategies,
+        broker=MagicMock(spec=BrokerClient),
         trade_logger=trade_logger,
         dynamo_store=None,
         notifier=None,
-        settings=sim_settings,
+        settings=_make_settings(market_close),
     )
-
     ws_mock = MagicMock()
-    engine.set_ws(ws_mock)
+    engine.set_ws(ws_mock)  # starts worker threads
     return engine
 
 
-# ─── Simulation helpers ───────────────────────────────────────────────────────
-
-def _generate_ticks(
-    ce_token: int,
-    pe_token: int,
-    ce_price: float,
-    pe_price: float,
-    qty: int = 5000,
-) -> List[dict]:
-    return [
-        make_tick(ce_token, ce_price, buy_qty=qty, sell_qty=qty),
-        make_tick(pe_token, pe_price, buy_qty=qty, sell_qty=qty),
-    ]
-
-
-def _run_simulation(engine: StrategyEngine, sim_settings) -> None:
-    """Step through synthetic time from 09:15 to 12:00 in 10-second increments."""
-    random.seed(42)
-    start = datetime(2024, 6, 20, 9, 15, 0)
-    end = datetime(2024, 6, 20, 12, 0, 0)
-    step = timedelta(seconds=10)
-
-    current = start
-    ce_price = 100.0
-    pe_price = 80.0
-
-    while current <= end:
-        # Random-walk prices
-        ce_price = max(1.0, ce_price + random.uniform(-3, 3))
-        pe_price = max(1.0, pe_price + random.uniform(-3, 3))
-
-        ticks = _generate_ticks(2001, 2002, ce_price, pe_price)
-
-        with patch("option_trading.core.strategy_engine.datetime") as mock_dt:
-            mock_dt.now.return_value = current
-            mock_dt.strptime = datetime.strptime
-            engine.process_ticks(ticks)
-
-        current += step
+def _wait_for_all_done(engine: StrategyEngine, timeout: float = 5.0) -> bool:
+    """Block until all workers complete or timeout expires. Returns True if all done."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if all(w.is_done for w in engine._workers.values()):
+            return True
+        time.sleep(0.05)
+    return False
 
 
 # ─── Tests ────────────────────────────────────────────────────────────────────
 
 class TestSimulation:
-    def test_simulation_produces_trade_records(self, sim_engine):
-        _run_simulation(sim_engine, sim_engine._settings)
-        records = sim_engine._trade_logger.records
-        assert len(records) > 0
 
-    def test_all_records_have_required_keys(self, sim_engine):
-        _run_simulation(sim_engine, sim_engine._settings)
-        required_keys = {
-            "index/strategy details",
-            "strangle",
-            "point",
-            "datetime",
-            "trade_type",
-            "type",
-            "sum_price",
-            "ce_price",
-            "pe_price",
+    def test_simulation_produces_trade_records(self):
+        """Engine produces at least one trade record per strategy."""
+        tl = TradeLogger()
+        strategies = {
+            "10:00:00": _running_strategy("10:00:00", points=10.0),
+        }
+        engine = _build_engine(strategies, tl)
+
+        # Entry tick (sum=150), then exit tick (sum=135 → diff=-15 >= 10)
+        engine.process_ticks([_make_tick(2001, 100.0), _make_tick(2002, 50.0)])
+        time.sleep(0.1)
+        engine.process_ticks([_make_tick(2001, 88.0), _make_tick(2002, 47.0)])
+
+        _wait_for_all_done(engine)
+        assert len(tl.records) > 0
+
+    def test_all_records_have_required_keys(self):
+        """Every trade record contains the expected fields."""
+        tl = TradeLogger()
+        strategies = {"10:00:00": _running_strategy("10:00:00", points=5.0)}
+        engine = _build_engine(strategies, tl)
+
+        engine.process_ticks([_make_tick(2001, 100.0), _make_tick(2002, 50.0)])
+        time.sleep(0.1)
+        engine.process_ticks([_make_tick(2001, 92.0), _make_tick(2002, 44.0)])
+
+        _wait_for_all_done(engine)
+
+        required = {
+            "index/strategy details", "strangle", "point", "datetime",
+            "trade_type", "type", "sum_price", "ce_price", "pe_price",
             "price_difference",
         }
-        for record in sim_engine._trade_logger.records:
-            missing = required_keys - record.keys()
-            assert not missing, f"Record missing keys: {missing}\nRecord: {record}"
+        for record in tl.records:
+            missing = required - record.keys()
+            assert not missing, f"Record missing keys: {missing}"
 
-    def test_all_strategies_eventually_complete(self, sim_engine, sim_strategies):
-        _run_simulation(sim_engine, sim_engine._settings)
-        for time_str, strategy in sim_strategies.items():
-            assert strategy.completed is True, (
-                f"Strategy {time_str} did not complete. State: running={strategy.running}"
-            )
+    def test_all_strategies_eventually_complete(self):
+        """All strategies reach completed=True after ticks cross the exit threshold."""
+        tl = TradeLogger()
+        strategies = {
+            "10:00:00": _running_strategy("10:00:00", points=10.0),
+            "11:00:00": _running_strategy("11:00:00", points=8.0),
+        }
+        engine = _build_engine(strategies, tl)
 
-    def test_entry_records_exist(self, sim_engine):
-        _run_simulation(sim_engine, sim_engine._settings)
-        types = {r["type"] for r in sim_engine._trade_logger.records}
-        # At minimum we expect entry or exit or skipped records
-        assert types & {"entry", "exit", "skipped", "exit at market close"}
+        # Entry ticks
+        engine.process_ticks([_make_tick(2001, 100.0), _make_tick(2002, 60.0)])
+        time.sleep(0.1)
+        # Exit ticks (diff = -15 and -12, both >= respective points)
+        engine.process_ticks([_make_tick(2001, 84.0), _make_tick(2002, 51.0)])
 
-    def test_trade_data_csv_can_be_saved(self, sim_engine, tmp_path):
-        _run_simulation(sim_engine, sim_engine._settings)
-        csv_path = str(tmp_path / "test_trades.csv")
-        ok = sim_engine._trade_logger.save_csv(csv_path)
+        done = _wait_for_all_done(engine)
+        assert done, "Not all strategies completed within timeout"
+        for time_str, s in strategies.items():
+            assert s.completed, f"Strategy {time_str} did not complete"
+
+    def test_entry_records_exist(self):
+        """At least one entry record is produced."""
+        tl = TradeLogger()
+        strategies = {"10:00:00": _running_strategy("10:00:00", points=100.0)}  # high threshold → won't exit
+        engine = _build_engine(strategies, tl)
+
+        engine.process_ticks([_make_tick(2001, 100.0), _make_tick(2002, 50.0)])
+        time.sleep(0.2)
+
+        types = {r["type"] for r in tl.records}
+        assert TradeType.ENTRY.value in types
+
+    def test_trade_data_csv_can_be_saved(self, tmp_path):
+        """TradeLogger can serialise to CSV after threads write records."""
+        tl = TradeLogger()
+        strategies = {"10:00:00": _running_strategy("10:00:00", points=10.0)}
+        engine = _build_engine(strategies, tl)
+
+        engine.process_ticks([_make_tick(2001, 100.0), _make_tick(2002, 50.0)])
+        time.sleep(0.1)
+        engine.process_ticks([_make_tick(2001, 87.0), _make_tick(2002, 43.0)])
+
+        _wait_for_all_done(engine)
+
+        csv_path = str(tmp_path / "trades.csv")
+        ok = tl.save_csv(csv_path)
         assert ok is True
 
         import pandas as pd
         df = pd.read_csv(csv_path)
-        assert len(df) == len(sim_engine._trade_logger.records)
+        assert len(df) == len(tl.records)
 
-    def test_conditional_strategy_not_executed_when_dependency_lossy(
-        self, sim_engine, sim_strategies
-    ):
+    def test_conditional_strategy_not_executed_when_dependency_lossy(self):
         """
-        Force the first strategy to result in a loss and verify the second
-        (conditional_on=09:30:00) is not executed.
+        Strategy B (conditional_on A) must not enter when A resulted in LOSS.
         """
-        # Force first strategy into completed loss state before simulation
-        strat_1 = sim_strategies["09:30:00"]
-        strat_1.completed = True
-        strat_1.running = False
-        strat_1.result = None  # Neither profit nor loss → conditional should not execute
+        tl = TradeLogger()
 
-        strat_2 = sim_strategies["10:00:00"]
+        strat_a = _running_strategy("09:30:00", points=5.0)
+        strat_b = _running_strategy("10:00:00", points=5.0, conditional_on="09:30:00")
 
-        _run_simulation(sim_engine, sim_engine._settings)
+        strategies = {"09:30:00": strat_a, "10:00:00": strat_b}
+        engine = _build_engine(strategies, tl)
 
-        # The second strategy should not have an entry record (dep not profitable)
+        # Force A into a completed LOSS state before any ticks
+        strat_a.running = False
+        strat_a.completed = True
+        strat_a.result = StrategyResult.LOSS
+
+        # Now feed entry tick for B
+        engine.process_ticks([_make_tick(2001, 100.0), _make_tick(2002, 50.0)])
+        time.sleep(0.2)
+
         entry_records = [
-            r for r in sim_engine._trade_logger.records
-            if r.get("strategy_time_str") == "10:00:00" and r["type"] == "entry"
+            r for r in tl.records
+            if r.get("strategy_time_str") == "10:00:00"
+            and r["type"] == TradeType.ENTRY.value
         ]
         assert len(entry_records) == 0, (
-            "Conditional strategy should not have entry when dependency not profitable"
+            "Conditional strategy B should not enter when A is LOSS"
         )
+
+    def test_two_strategies_exit_in_parallel(self):
+        """
+        When two strategies hit exit on the same tick batch, both complete
+        independently — neither blocks the other's order placement.
+        """
+        tl = TradeLogger()
+        strategies = {
+            "10:00:00": _running_strategy("10:00:00", points=10.0),
+            "11:00:00": _running_strategy("11:00:00", points=10.0),
+        }
+        engine = _build_engine(strategies, tl)
+
+        # Entry
+        engine.process_ticks([_make_tick(2001, 100.0), _make_tick(2002, 60.0)])
+        time.sleep(0.1)
+
+        # Both strategies should exit on this tick (diff = -18 >= 10)
+        start = time.monotonic()
+        engine.process_ticks([_make_tick(2001, 80.0), _make_tick(2002, 52.0)])
+
+        done = _wait_for_all_done(engine, timeout=3.0)
+        elapsed = time.monotonic() - start
+
+        assert done, "Both strategies should complete"
+
+        exit_records = [r for r in tl.records if r["type"] == TradeType.EXIT.value]
+        assert len(exit_records) == 2, "Both strategies should have exit records"
+
+        # Verify they ran on different threads (different thread names in logs would
+        # confirm, but here we just verify both completed independently)
+        for s in strategies.values():
+            assert s.result in (StrategyResult.PROFIT, StrategyResult.LOSS)

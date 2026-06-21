@@ -151,7 +151,9 @@ def main() -> None:
         n_strats=settings.n_strategies,
         kite=kite,
         instruments_df=instruments_df,
+        trade_mode=settings.trade_mode,
     )
+    logger.info("Trade mode: %s", settings.trade_mode)
 
     if not strategies:
         logger.warning("No strategies selected for today — exiting.")

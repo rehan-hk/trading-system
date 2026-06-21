@@ -3,6 +3,7 @@ Trade logger — accumulates in-memory trade records and persists to CSV / Dynam
 """
 from __future__ import annotations
 
+import threading
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -20,14 +21,18 @@ class TradeLogger:
     """
     Accumulates trade event records during a session and provides
     serialisation to CSV and DynamoDB.
+
+    Thread-safe: multiple StrategyWorker threads may call log() concurrently.
     """
 
     def __init__(self) -> None:
         self._records: List[Dict[str, Any]] = []
+        self._lock = threading.Lock()
 
     def log(self, record: Dict[str, Any]) -> None:
-        """Append a trade event record."""
-        self._records.append(record)
+        """Append a trade event record. Safe to call from multiple threads."""
+        with self._lock:
+            self._records.append(record)
         logger.debug("Trade logged — type=%s", record.get("type", "unknown"))
 
     @property

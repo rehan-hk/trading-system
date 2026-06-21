@@ -27,6 +27,7 @@ def get_strategies_to_run_today(
     kite: Any,
     instruments_df: pd.DataFrame,
     as_of: Optional[datetime] = None,
+    trade_mode: str = "dummy",
 ) -> Dict[str, Strategy]:
     """
     Select the top *n_strats* strategies for today's day of the week.
@@ -71,12 +72,13 @@ def get_strategies_to_run_today(
             kite, instruments_df, index, strangle, as_of=as_of
         )
 
+        mode = TradeMode.REAL if trade_mode == "real" else TradeMode.DUMMY
         strategy = Strategy(
             time_str=time_key,
             index=index,
             strangle=strangle,
             points=exit_point,
-            trade_type=TradeMode.REAL,
+            trade_type=mode,
             conditional_on=None,
             ce_symbol=ce_symbol,
             pe_symbol=pe_symbol,

@@ -20,5 +20,6 @@ class Settings(BaseSettings):
     entry_tolerance_seconds: int = 15
     market_close_time: str = "15:30:00"
     strategies_csv: str = "GROUPED_tier_1_results.csv"
+    trade_mode: str = "dummy"  # "dummy" | "real" — default safe
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
