@@ -1,0 +1,172 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Option Trading Engine — AWS infrastructure
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging]
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Email address for SNS alert notifications (optional)
+
+Resources:
+
+  # ── DynamoDB: strategy state ────────────────────────────────────────────────
+  TradingStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: trading-engine-state
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: trading_date
+          AttributeType: S
+        - AttributeName: strategy_time
+          AttributeType: S
+      KeySchema:
+        - AttributeName: trading_date
+          KeyType: HASH
+        - AttributeName: strategy_time
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── DynamoDB: trade records ─────────────────────────────────────────────────
+  TradingTradesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: trading-engine-trades
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: trading_date
+          AttributeType: S
+        - AttributeName: strategy_time
+          AttributeType: S
+      KeySchema:
+        - AttributeName: trading_date
+          KeyType: HASH
+        - AttributeName: strategy_time
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── S3 bucket for trade data archives ──────────────────────────────────────
+  TradingDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub option-trading-data-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: archive-after-30-days
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── SNS topic for alerts ────────────────────────────────────────────────────
+  TradingAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: trading-alerts
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  TradingAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref TradingAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ── CloudWatch log group ────────────────────────────────────────────────────
+  TradingEngineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/trading-engine
+      RetentionInDays: 30
+
+  # ── IAM role for ECS task ───────────────────────────────────────────────────
+  TradingEngineTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: trading-engine-task-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TradingEnginePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt TradingStateTable.Arn
+                  - !GetAtt TradingTradesTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub ${TradingDataBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref TradingAlertsTopic
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:trading-engine/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt TradingEngineLogGroup.Arn
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Outputs:
+  StateTableName:
+    Value: !Ref TradingStateTable
+  TradesTableName:
+    Value: !Ref TradingTradesTable
+  S3BucketName:
+    Value: !Ref TradingDataBucket
+  SnsTopicArn:
+    Value: !Ref TradingAlertsTopic
+  TaskRoleArn:
+    Value: !GetAtt TradingEngineTaskRole.Arn
+  LogGroupName:
+    Value: !Ref TradingEngineLogGroup
